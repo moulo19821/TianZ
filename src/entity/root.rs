@@ -82,6 +82,7 @@ impl Root {
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_variables)]
     use super::*;
     use std::borrow::Cow;
     use std::cell::RefCell;

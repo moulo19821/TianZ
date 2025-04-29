@@ -33,7 +33,7 @@ fn bench_server(c: &mut Criterion) {
     std::thread::spawn(move || {
         let _ = server_rt.block_on(async {
             let server = TiangZ::Server::new("127.0.0.1:8080").await;
-            server.run(*WORK_THREAD_NUM, *QUEUE_LEN).await;
+            server.run(*WORK_THREAD_NUM, *QUEUE_LEN).await.unwrap();
         });
     });
     

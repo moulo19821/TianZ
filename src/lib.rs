@@ -1,3 +1,5 @@
+#![allow(unused_variables, unused_imports, non_snake_case, dead_code)]
+
 use std::collections::HashMap;
 use std::sync::{LazyLock, Arc, atomic::{AtomicUsize, Ordering}};
 use std::io;
