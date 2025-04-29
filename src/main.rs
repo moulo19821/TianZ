@@ -59,7 +59,7 @@ async fn main() -> io::Result<()> {
     root.run().await;
     
     // 启动网络服务器
-    let server = TiangZ::Server::new("0.0.0.0:8080").await;
+    let server = TiangZ::KCPServer::new("0.0.0.0:3100", "0.0.0.0:3101").await;
     
     // 运行服务器
     tokio::select! {

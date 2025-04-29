@@ -284,34 +284,65 @@ struct KcpClientConnection {
     client_id: usize, 
     addr: std::net::SocketAddr,
     writer: Option<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
-    reader: tokio_kcp::KcpStream,
+    reader: Arc<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
-    request_sender: mpsc::Sender<NetworkMessage>
+    request_sender: mpsc::Sender<NetworkMessage>,
+    clients: Arc<DashMap<usize, KcpClientConnection>>,
 }
 
 impl KcpClientConnection {
     pub fn new(client_id: usize, addr: std::net::SocketAddr, reader: tokio_kcp::KcpStream, 
-        runtime: std::sync::Arc<tokio::runtime::Runtime>, request_sender: mpsc::Sender<NetworkMessage>) -> KcpClientConnection{
-        KcpClientConnection{client_id, addr,  writer:None, reader, runtime, request_sender}
+        runtime: std::sync::Arc<tokio::runtime::Runtime>, request_sender: mpsc::Sender<NetworkMessage>, clients: Arc<DashMap<usize, KcpClientConnection>>) -> KcpClientConnection {
+        KcpClientConnection {
+            client_id, 
+            addr, 
+            writer: None, 
+            reader: Arc::new(tokio::sync::Mutex::new(reader)),
+            runtime, 
+            request_sender,
+            clients: Arc::new(DashMap::new()),
+        }
     }
 
-    pub async fn init(&mut self) {
-        //向reader发送秘钥，用来区分write链接
-        self.reader.write_all(format!("KEY|{}", self.client_id).as_bytes()).await.unwrap();
+    pub async fn init(&self) {
+        let mut buffer = [0u8; 32];
+        let n = self.reader.lock().await.read(&mut buffer).await.unwrap();
+        if n == 0 {
+            //TODO 消息不合法，清理
+        }
+        info!("收到Sync消息，正在解析{}", std::str::from_utf8(&buffer).unwrap());
+        let prefix = b"Sync|";
+        if buffer.starts_with(prefix) {
+            let msg = format!("SyncAck|{}", self.client_id);
+            info!("正在发送SyncAck|: {}", msg);
+            self.reader.lock().await.write_all(msg.as_bytes()).await.unwrap();
+        } else {
+            //TODO 消息不合法，清理
+        }
     }
 
     pub fn set_writer(&mut self, writer: tokio_kcp::KcpStream) {
         self.writer = Some(tokio::sync::Mutex::new(writer));
     }
 
+    pub async fn write_all(&self, data: &[u8]) -> io::Result<()> {
+        self.writer.as_ref().unwrap().lock().await.write_all(data).await
+    }
+
     pub fn run(&mut self) {
-        self.runtime.spawn(async move {
+        let client_id = self.client_id;
+        let reader = Arc::clone(&self.reader);
+        let request_sender = self.request_sender.clone();
+        let runtime = self.runtime.clone();
+        
+        runtime.spawn(async move {
             let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
             loop {
-                match b.read_frame_from_kcp(&mut self.reader).await {
+                let mut reader_guard = reader.lock().await;
+                match b.read_frame_from_kcp(&mut *reader_guard).await {
                     Ok(Some(message)) => {
                         // 使用提取的函数处理消息
-                        if let Err(err) = process_frame_message(&message, self.client_id, &self.request_sender).await {
+                        if let Err(err) = process_frame_message(&message, client_id, &request_sender).await {
                             match *err.downcast_ref::<MyError>().unwrap() {
                                 // 对于关键错误，断开连接
                                 MyError::SendRequestFailed() => break,
@@ -320,18 +351,17 @@ impl KcpClientConnection {
                         }
                     },
                     Ok(None) => {
-                        info!("客户端正常关闭, client:{}, 关闭socket: 协程退出", self.client_id);
+                        info!("客户端正常关闭, client:{}, 关闭socket: 协程退出", client_id);
                         break;
                     },
                     Err(e) => {
-                        error!("客户端异常关闭, client:{}, 关闭socket, Err:{e} 协程退出", self.client_id);
+                        error!("客户端异常关闭, client:{}, 关闭socket, Err:{e} 协程退出", client_id);
                         break;
                     }
                 }
             }
 
-            trace!("read frame client:{} 协程退出", self.client_id);
-            //clientx.remove(&self.client_id);
+            trace!("read frame client:{} 协程退出", client_id);
             return;
         });
     }
@@ -390,7 +420,7 @@ impl KCPServer {
                             match result {
                                 Some(NetworkMessage::Response { client_id, data }) => {
                                     if let Some(client_connection) = clients.get(&client_id) {
-                                        if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
+                                        if let Err(e) = client_connection.write_all(data.to_bytes().as_ref()).await {
                                             error!("write_all clientid:{}, 出错:{}", client_id, e);
                                         }
                                     } else {
@@ -418,57 +448,23 @@ impl KCPServer {
         let client_id = self.client_ids.clone();
       
         let mut s_receiver = shutdown_sender.subscribe();
+        let rt1 = rt.clone();
         rt.spawn(async move {
             loop {
                 tokio::select! {
                     result = read_listener.accept() => {
-                        if let Ok((mut socket, addr)) = result {
+                        if let Ok((socket, addr)) = result {
     
                             let client_id = client_id.fetch_add(1, Ordering::SeqCst);
                             info!("新连接: {:?}, {}，当前共有{}个客户端", addr, client_id, clients.len());
                             
-
                             let client_connection = KcpClientConnection::new(
-                                client_id, addr.clone(), socket, Arc::clone(&rt), request_sender.clone());
+                                client_id, addr.clone(), socket, Arc::clone(&rt1), request_sender.clone(), clients.clone());
+
+                            //给前端发送Sync消息，附带客户端的ID
+                            client_connection.init().await;
 
                             clients.insert(client_id, client_connection);
-    
-    
-                            //let clientx = clients.clone();
-
-                            client_connection.init().await;
-    
-                            // rt1.spawn(async move {
-                                
-                            //     let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
-                                
-                            //     loop {
-                            //         match b.read_frame_from_kcp(&mut socket).await {
-                            //             Ok(Some(message)) => {
-                            //                 // 使用提取的函数处理消息
-                            //                 if let Err(err) = process_frame_message(&message, client_id, &request_sender).await {
-                            //                     match *err.downcast_ref::<MyError>().unwrap() {
-                            //                         // 对于关键错误，断开连接
-                            //                         MyError::SendRequestFailed() => break,
-                            //                         _ => continue,
-                            //                     }
-                            //                 }
-                            //             },
-                            //             Ok(None) => {
-                            //                 info!("客户端正常关闭, client:{client_id}, 关闭socket: 协程退出");
-                            //                 break;
-                            //             },
-                            //             Err(e) => {
-                            //                 error!("客户端异常关闭, client:{client_id}, 关闭socket, Err:{e} 协程退出");
-                            //                 break;
-                            //             }
-                            //         }
-                            //     }
-    
-                            //     trace!("read frame client:{client_id} 协程退出");
-                            //     clientx.remove(&client_id);
-                            //     return;
-                            // });
                         } else {
                             error!("accept 失败，退出");
                             return;
@@ -481,14 +477,19 @@ impl KCPServer {
                             //第一个接受的肯定是验证数据
                             let mut buffer = [0u8; 128];
                             let n = socket.read(&mut buffer).await.unwrap();
+                            if n == 0 {
+                                //TODO 消息不合法，清理
+                            }
 
-                            let prefix = b"Write|";
+                            let prefix = b"Ack|";
                             if buffer.starts_with(prefix) {
-                                let client_id = std::str::from_utf8(&buffer[prefix.len()..]).unwrap().parse::<usize>().unwrap();
-                                let KcpClientConnection = clients.get_mut(&client_id).unwrap();
-                                KcpClientConnection.set_writer(socket);
+
+                                let client_id_string = parse_null_terminated(&buffer[prefix.len()..]);
+                                let client_id = client_id_string.parse::<usize>().unwrap();
+                                let mut kcpClientConnection = clients.get_mut(&client_id).unwrap();
+                                kcpClientConnection.set_writer(socket);
                                 //成功设置以后，kcp才可以工作
-                                KcpClientConnection.run();
+                                kcpClientConnection.run();
                             }
                         }
                     }
@@ -765,7 +766,7 @@ pub struct C2M_PingHandler;
 impl C2M_PingHandler  {
     async fn run(&self, _request: &C2M_PingRequest, _response: &mut C2M_PingResponse)  {
         _response.count += 1;
-        trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
+        info!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
     }
 }
 
@@ -870,12 +871,15 @@ impl ProtocolParser {
                     return Ok(Some(frame));
                 }
                 None => {
+                    let mut temp_buff = [0u8; 128];
                     tokio::select! {
-                        ret = reader.read(&mut self.buffer) => {
-                            if ret? == 0 {
+                        ret = reader.read(&mut temp_buff) => {
+                            let n = ret?;
+                            if n == 0 {
                                 return Ok(None);
                             } else {
                                 // 需要更多数据
+                                self.buffer.extend_from_slice(&temp_buff[..n]);
                                 continue;
                             }
                         }   
@@ -964,6 +968,11 @@ async fn process_frame_message(
     Ok(())
 }
 
+fn parse_null_terminated(bytes: &[u8]) -> &str {
+    // 找到第一个 `0` 的位置，截取之前的部分
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap() // 安全：已知有效 UTF-8
+}
 
 
 #[cfg(test)]
