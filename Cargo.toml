@@ -60,6 +60,6 @@ harness = false
 [profile.release]
 opt-level = 3
 codegen-units = 1  
-
+debug = true
 
 

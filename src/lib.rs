@@ -387,11 +387,28 @@ impl KCPServer {
     
     pub async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
         
+        let config = tokio_kcp::KcpConfig {
+            mtu: 470,
+            nodelay: tokio_kcp::KcpNoDelayConfig{
+                nodelay: true,
+                interval: 10,
+                resend: 2,
+                nc: false,
+            },
+
+            wnd_size: (32, 32),
+            session_expire: std::time::Duration::from_secs(90),
+            flush_write: true,
+            flush_acks_input: false,
+            stream: false,
+            allow_recv_empty_packet: false,
+        };
+
         let mut read_listener = tokio_kcp::KcpListener::bind(
-            tokio_kcp::KcpConfig::default(), self.addr_read.clone()).await.unwrap();
+            config, self.addr_read.clone()).await.unwrap();
 
         let mut write_listener = tokio_kcp::KcpListener::bind(
-            tokio_kcp::KcpConfig::default(), self.addr_write.clone()).await.unwrap();
+            config, self.addr_write.clone()).await.unwrap();
         
         info!("KCP服务器启动成功,  监听read端口:{}  write端口:{}", self.addr_read, self.addr_write);
 
@@ -766,7 +783,7 @@ pub struct C2M_PingHandler;
 impl C2M_PingHandler  {
     async fn run(&self, _request: &C2M_PingRequest, _response: &mut C2M_PingResponse)  {
         _response.count += 1;
-        info!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
+        trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
     }
 }
 
