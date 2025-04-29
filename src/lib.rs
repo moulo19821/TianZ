@@ -5,12 +5,7 @@ use std::sync::{LazyLock, Arc, atomic::{AtomicUsize, Ordering}};
 use std::io;
 use std::future::pending;
 use std::any::Any;
-
-#[allow(unused_imports)]
 use std::thread;
-
-use gen_macro::{IActorLocationRpcHandler, IActorLocationRpcRequest, IActorLocationRpcResponse, 
-    IActorLocationMessageRequest, IActorLocationMessageHandler, Singleton};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,20 +14,18 @@ use tokio::sync::{mpsc, broadcast};
 use tokio::signal;
 use bytes::{BytesMut, Buf};
 use dashmap::DashMap;
-#[allow(unused_imports)]
 use tokio::time::{sleep, Duration};
 use async_trait::async_trait;
-#[allow(unused_imports)]
 use tracing::{trace, error, info, warn, debug};
+use tokio_kcp::KcpStream;
 
+use gen_macro::{IActorLocationRpcHandler, IActorLocationRpcRequest, IActorLocationRpcResponse, 
+    IActorLocationMessageRequest, IActorLocationMessageHandler, Singleton};
 
 mod errors;
 mod struct_macro;
 mod et_event;
-
-#[allow(non_snake_case)]
 mod my_future;
-
 use crate::errors::my_errors::RetResult;
 use crate::errors::my_errors::MyError;
 
@@ -288,206 +281,283 @@ async fn handle_signal() {
 //////////////////////////////////////////////////////////////////////////////////////////////
 
 struct KcpClientConnection {
+    client_id: usize, 
     addr: std::net::SocketAddr,
-    writer: tokio::sync::Mutex<tokio_kcp::KcpStream>,
+    writer: Option<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
+    reader: tokio_kcp::KcpStream,
+    runtime: std::sync::Arc<tokio::runtime::Runtime>,
+    request_sender: mpsc::Sender<NetworkMessage>
+}
+
+impl KcpClientConnection {
+    pub fn new(client_id: usize, addr: std::net::SocketAddr, reader: tokio_kcp::KcpStream, 
+        runtime: std::sync::Arc<tokio::runtime::Runtime>, request_sender: mpsc::Sender<NetworkMessage>) -> KcpClientConnection{
+        KcpClientConnection{client_id, addr,  writer:None, reader, runtime, request_sender}
+    }
+
+    pub async fn init(&mut self) {
+        //向reader发送秘钥，用来区分write链接
+        self.reader.write_all(format!("KEY|{}", self.client_id).as_bytes()).await.unwrap();
+    }
+
+    pub fn set_writer(&mut self, writer: tokio_kcp::KcpStream) {
+        self.writer = Some(tokio::sync::Mutex::new(writer));
+    }
+
+    pub fn run(&mut self) {
+        self.runtime.spawn(async move {
+            let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
+            loop {
+                match b.read_frame_from_kcp(&mut self.reader).await {
+                    Ok(Some(message)) => {
+                        // 使用提取的函数处理消息
+                        if let Err(err) = process_frame_message(&message, self.client_id, &self.request_sender).await {
+                            match *err.downcast_ref::<MyError>().unwrap() {
+                                // 对于关键错误，断开连接
+                                MyError::SendRequestFailed() => break,
+                                _ => continue,
+                            }
+                        }
+                    },
+                    Ok(None) => {
+                        info!("客户端正常关闭, client:{}, 关闭socket: 协程退出", self.client_id);
+                        break;
+                    },
+                    Err(e) => {
+                        error!("客户端异常关闭, client:{}, 关闭socket, Err:{e} 协程退出", self.client_id);
+                        break;
+                    }
+                }
+            }
+
+            trace!("read frame client:{} 协程退出", self.client_id);
+            //clientx.remove(&self.client_id);
+            return;
+        });
+    }
 }
 
 pub struct KCPServer {
     clients: Arc<DashMap<usize, KcpClientConnection>>,
-    addr: String,
-    client_id: Arc<AtomicUsize>,
+    addr_read: String,
+    addr_write: String,
+    client_ids: Arc<AtomicUsize>,
 }
 
-// impl KCPServer {
-//     pub async fn new(addr: &str) -> Self {
-//         KCPServer {
-//             clients: Arc::new(DashMap::new()),
-//             addr: addr.to_string(),
-//             client_id: Arc::new(AtomicUsize::new(0)),
-//         }
-//     }
+impl KCPServer {
+
+    pub async fn new(addr_read: &str, addr_write: &str) -> Self {
+        KCPServer {
+            clients: Arc::new(DashMap::new()),
+            addr_read: addr_read.to_string(),
+            addr_write: addr_write.to_string(),
+            client_ids: Arc::new(AtomicUsize::new(0)),
+        }
+    }
     
-//     pub async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
+    pub async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
         
-//         let mut listener = tokio_kcp::KcpListener::bind(
-//             tokio_kcp::KcpConfig::default(), self.addr.clone()).await.unwrap();
+        let mut read_listener = tokio_kcp::KcpListener::bind(
+            tokio_kcp::KcpConfig::default(), self.addr_read.clone()).await.unwrap();
+
+        let mut write_listener = tokio_kcp::KcpListener::bind(
+            tokio_kcp::KcpConfig::default(), self.addr_write.clone()).await.unwrap();
         
-//         info!("KCP服务器启动成功，监听端口:{}", self.addr);
+        info!("KCP服务器启动成功,  监听read端口:{}  write端口:{}", self.addr_read, self.addr_write);
 
-//         let (shutdown_sender, _) = broadcast::channel(1);
+        let (shutdown_sender, _) = broadcast::channel(1);
 
-//         let rt = start_runtime(work_thead_num);
+        let rt = start_runtime(work_thead_num);
 
-//         let channels: Vec<(mpsc::Sender<NetworkMessage>, mpsc::Receiver<NetworkMessage>)> = (0..work_thead_num)
-//         .map(|_| mpsc::channel(queue_len))
-//         .collect();
+        let channels: Vec<(mpsc::Sender<NetworkMessage>, mpsc::Receiver<NetworkMessage>)> = (0..work_thead_num)
+        .map(|_| mpsc::channel(queue_len))
+        .collect();
 
 
-//         let senders: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
-//         let receivers: Vec<_> = channels.into_iter().map(|(_, rx)| rx).collect();
+        let senders: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
+        let receivers: Vec<_> = channels.into_iter().map(|(_, rx)| rx).collect();
 
-//         let (request_sender, mut request_receiver) = mpsc::channel(queue_len * work_thead_num);
+        let (request_sender, mut request_receiver) = mpsc::channel(queue_len * work_thead_num);
 
-//         //做工线程，从
-//         let _: Vec<_> = receivers.into_iter().enumerate().map(|(_, mut rx)| {
-//             let mut s_receiver = shutdown_sender.subscribe();
-//             let clients = self.clients.clone();
-//             rt.spawn(async move {
-//                 loop {
-//                     tokio::select! {
-//                         result = rx.recv() => {
-//                             match result {
-//                                 Some(NetworkMessage::Response { client_id, data }) => {
-//                                     if let Some(client_connection) = clients.get(&client_id) {
-//                                         if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
-//                                             error!("write_all clientid:{}, 出错:{}", client_id, e);
-//                                         }
-//                                     } else {
-//                                         warn!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
-//                                     }
-//                                 }
-//                                 _ => {
-//                                     info!("通道已关闭，退出");
-//                                     break; // 连接关闭
-//                                 }
-//                             }
-//                         }
-//                         _ = s_receiver.recv() => {
-//                             info!("client_connection.writer 收到退出消息，退出");
-//                             break; // 退出循环
-//                         }
-//                     }
-//                 }
-//             });
+        //做工线程，从
+        let _: Vec<_> = receivers.into_iter().enumerate().map(|(_, mut rx)| {
+            let mut s_receiver = shutdown_sender.subscribe();
+            let clients = self.clients.clone();
+            rt.spawn(async move {
+                loop {
+                    tokio::select! {
+                        result = rx.recv() => {
+                            match result {
+                                Some(NetworkMessage::Response { client_id, data }) => {
+                                    if let Some(client_connection) = clients.get(&client_id) {
+                                        if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
+                                            error!("write_all clientid:{}, 出错:{}", client_id, e);
+                                        }
+                                    } else {
+                                        warn!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
+                                    }
+                                }
+                                _ => {
+                                    info!("通道已关闭，退出");
+                                    break; // 连接关闭
+                                }
+                            }
+                        }
+                        _ = s_receiver.recv() => {
+                            info!("client_connection.writer 收到退出消息，退出");
+                            break; // 退出循环
+                        }
+                    }
+                }
+            });
         
-//         }).collect();
+        }).collect();
         
         
-//         let clients = self.clients.clone();
-//         let client_id = self.client_id.clone();
-
-//         let rt1 = Arc::clone(&rt);
-        
-//         let mut s_receiver = shutdown_sender.subscribe();
-//         rt.spawn(async move {
-//             loop {
-//                 tokio::select! {
-//                     result = listener.accept() => {
-//                         if let Ok((mut socket, addr)) = result {
+        let clients = self.clients.clone();
+        let client_id = self.client_ids.clone();
+      
+        let mut s_receiver = shutdown_sender.subscribe();
+        rt.spawn(async move {
+            loop {
+                tokio::select! {
+                    result = read_listener.accept() => {
+                        if let Ok((mut socket, addr)) = result {
     
-//                             let client_id = client_id.fetch_add(1, Ordering::SeqCst);
-//                             info!("新连接: {:?}, {}，当前共有{}个客户端", addr, client_id, clients.len());
+                            let client_id = client_id.fetch_add(1, Ordering::SeqCst);
+                            info!("新连接: {:?}, {}，当前共有{}个客户端", addr, client_id, clients.len());
                             
 
-//                             let client_connection = KcpClientConnection {
-//                                 addr: addr.clone(),
-//                                 writer: tokio::sync::Mutex::new(socket.clone()),
-//                             };
-//                             clients.insert(client_id, client_connection);
+                            let client_connection = KcpClientConnection::new(
+                                client_id, addr.clone(), socket, Arc::clone(&rt), request_sender.clone());
+
+                            clients.insert(client_id, client_connection);
     
-//                             let request_sender = request_sender.clone();
     
-//                             let clientx = clients.clone();
+                            //let clientx = clients.clone();
+
+                            client_connection.init().await;
     
-//                             rt1.spawn(async move {
+                            // rt1.spawn(async move {
                                 
-//                                 let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
+                            //     let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
                                 
-//                                 loop {
-//                                     match b.read_frame_from_kcp(&mut socket).await {
-//                                         Ok(Some(message)) => {
-//                                             // 使用提取的函数处理消息
-//                                             if let Err(err) = process_frame_message(&message, client_id, &request_sender).await {
-//                                                 match *err.downcast_ref::<MyError>().unwrap() {
-//                                                     // 对于关键错误，断开连接
-//                                                     MyError::SendRequestFailed() => break,
-//                                                     _ => continue,
-//                                                 }
-//                                             }
-//                                         },
-//                                         Ok(None) => {
-//                                             info!("客户端正常关闭, client:{client_id}, 关闭socket: 协程退出");
-//                                             break;
-//                                         },
-//                                         Err(e) => {
-//                                             error!("客户端异常关闭, client:{client_id}, 关闭socket, Err:{e} 协程退出");
-//                                             break;
-//                                         }
-//                                     }
-//                                 }
+                            //     loop {
+                            //         match b.read_frame_from_kcp(&mut socket).await {
+                            //             Ok(Some(message)) => {
+                            //                 // 使用提取的函数处理消息
+                            //                 if let Err(err) = process_frame_message(&message, client_id, &request_sender).await {
+                            //                     match *err.downcast_ref::<MyError>().unwrap() {
+                            //                         // 对于关键错误，断开连接
+                            //                         MyError::SendRequestFailed() => break,
+                            //                         _ => continue,
+                            //                     }
+                            //                 }
+                            //             },
+                            //             Ok(None) => {
+                            //                 info!("客户端正常关闭, client:{client_id}, 关闭socket: 协程退出");
+                            //                 break;
+                            //             },
+                            //             Err(e) => {
+                            //                 error!("客户端异常关闭, client:{client_id}, 关闭socket, Err:{e} 协程退出");
+                            //                 break;
+                            //             }
+                            //         }
+                            //     }
     
-//                                 trace!("read frame client:{client_id} 协程退出");
-//                                 clientx.remove(&client_id);
-//                                 return;
-//                             });
-//                         } else {
-//                             error!("accept 失败，退出");
-//                             return;
-//                         }
-//                     }
-//                     _ = s_receiver.recv() => {
-//                         info!("listener.accept received shutdown signal, exit");
-//                         return; // 退出
-//                     }
-//                 }
-//             }
-//         });
+                            //     trace!("read frame client:{client_id} 协程退出");
+                            //     clientx.remove(&client_id);
+                            //     return;
+                            // });
+                        } else {
+                            error!("accept 失败，退出");
+                            return;
+                        }
+                    }
 
 
-//         'outer: loop {
+                    result = write_listener.accept() => {
+                        if let Ok((mut socket, addr)) = result {
+                            //第一个接受的肯定是验证数据
+                            let mut buffer = [0u8; 128];
+                            let n = socket.read(&mut buffer).await.unwrap();
+
+                            let prefix = b"Write|";
+                            if buffer.starts_with(prefix) {
+                                let client_id = std::str::from_utf8(&buffer[prefix.len()..]).unwrap().parse::<usize>().unwrap();
+                                let KcpClientConnection = clients.get_mut(&client_id).unwrap();
+                                KcpClientConnection.set_writer(socket);
+                                //成功设置以后，kcp才可以工作
+                                KcpClientConnection.run();
+                            }
+                        }
+                    }
+
+
+
+                    _ = s_receiver.recv() => {
+                        info!("listener.accept received shutdown signal, exit");
+                        return; // 退出
+                    }
+                }
+            }
+        });
+
+
+        'outer: loop {
             
-//             tokio::select! {
-//                 result = request_receiver.recv() => {
-//                     match result {
-//                         Some(NetworkMessage::Request { client_id, data }) => {
-//                             process_message_msgpack(data, client_id, std::option::Option::Some(&senders[client_id%(work_thead_num)])).await;
-//                         }
-//                         Some(NetworkMessage::Message { data }) => {
-//                             process_message_msgpack(data, 0, std::option::Option::None).await;
-//                         }
-//                         _ => {
-//                             error!("request_receiver 通道已关闭");
-//                             break; // 连接关闭
-//                         }
-//                     }
-//                 }
+            tokio::select! {
+                result = request_receiver.recv() => {
+                    match result {
+                        Some(NetworkMessage::Request { client_id, data }) => {
+                            process_message_msgpack(data, client_id, std::option::Option::Some(&senders[client_id%(work_thead_num)])).await;
+                        }
+                        Some(NetworkMessage::Message { data }) => {
+                            process_message_msgpack(data, 0, std::option::Option::None).await;
+                        }
+                        _ => {
+                            error!("request_receiver 通道已关闭");
+                            break; // 连接关闭
+                        }
+                    }
+                }
             
-//                 _result = signal::ctrl_c() => {
-//                     info!("CTRL_C 被按下，服务器终止！");
-//                     shutdown_sender.send(()).unwrap();
-//                     break 'outer;
-//                 }
+                _result = signal::ctrl_c() => {
+                    info!("CTRL_C 被按下，服务器终止！");
+                    shutdown_sender.send(()).unwrap();
+                    break 'outer;
+                }
 
-//                 _result = handle_signal() => {
-//                     info!("收到kill ，服务器终止！");
-//                     shutdown_sender.send(()).unwrap();
-//                     break 'outer;
-//                 }
-//             }
-//         }
+                _result = handle_signal() => {
+                    info!("收到kill ，服务器终止！");
+                    shutdown_sender.send(()).unwrap();
+                    break 'outer;
+                }
+            }
+        }
 
-//         shutdown_sender.send(()).unwrap();
+        shutdown_sender.send(()).unwrap();
 
-//         sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
 
-//         //终止创建的运行时
-//         match Arc::try_unwrap(rt) {
-//             Ok(rt) => rt.shutdown_background(),
-//             Err(_) => eprintln!("Failed to shutdown: Runtime is still shared"),
-//         }
+        //终止创建的运行时
+        match Arc::try_unwrap(rt) {
+            Ok(rt) => rt.shutdown_background(),
+            Err(_) => eprintln!("Failed to shutdown: Runtime is still shared"),
+        }
 
-//         // loop {
-//         //     let rt = rt.clone();
-//         //     match Arc::try_unwrap(rt) {
-//         //         Ok(rt) => {rt.shutdown_background(); break;}
-//         //         Err(_) => continue,
-//         //     }
-//         // }
+        // loop {
+        //     let rt = rt.clone();
+        //     match Arc::try_unwrap(rt) {
+        //         Ok(rt) => {rt.shutdown_background(); break;}
+        //         Err(_) => continue,
+        //     }
+        // }
 
-//         Ok(())
-//         //ETTask::complete().await; 
-//     }
-// }
+        Ok(())
+        //ETTask::complete().await; 
+    }
+}
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////
