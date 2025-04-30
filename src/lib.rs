@@ -24,7 +24,7 @@ use gen_macro::{IActorLocationRpcHandler, IActorLocationRpcRequest, IActorLocati
 
 mod errors;
 mod struct_macro;
-mod et_event;
+mod event;
 mod my_future;
 mod protocol_parser;
 mod kcp_wrapper;

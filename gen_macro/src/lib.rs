@@ -1239,13 +1239,13 @@ pub fn derive_event_handler(input: TokenStream) -> TokenStream {
 
     let token_stream = quote! {
         impl #struct_name {
-            fn register_handler(all_call_back: &crate::et_event::event_system::EventSystem) {
+            fn register_handler(all_call_back: &crate::event::event_system::EventSystem) {
                 all_call_back.register_call_back::<#event_type>(#struct_name);
             }
         }
 
         inventory::submit! {
-            crate::et_event::event_system::CallBackHandlerFactory {
+            crate::event::event_system::CallBackHandlerFactory {
                 register_fn: #struct_name::register_handler,
             }
         }
@@ -1284,20 +1284,20 @@ pub fn derive_event_handler(input: TokenStream) -> TokenStream {
 //         // 定义初始化函数来注册事件处理器
 //         impl #struct_name {
 //             // 内部函数，在EventSystem初始化时会被调用
-//             pub fn register_handler(system: &crate::et_event::event_system::EventSystem) {
+//             pub fn register_handler(system: &crate::event::event_system::EventSystem) {
 //                 system.register::<#event_type>(#struct_name::default());
 //             }
             
 //             // 公共函数，可以在任何地方手动调用进行注册
 //             pub fn register() {
-//                 crate::et_event::event_system::EventSystem::instance()
+//                 crate::event::event_system::EventSystem::instance()
 //                     .register::<#event_type>(#struct_name::default());
 //             }
 //         }
         
 //         // 在模块初始化时自动添加到注册列表
 //         inventory::submit! {
-//             crate::et_event::event_system::EventHandlerFactory {
+//             crate::event::event_system::EventHandlerFactory {
 //                 name: concat!(stringify!(#struct_name), "_factory"),
 //                 register_fn: #struct_name::register_handler,
 //             }
