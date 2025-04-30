@@ -123,9 +123,11 @@ impl Server for TCPServer {
                                     if let Some(client_connection) = clients.get(&client_id) {
                                         if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
                                             error!("write_all clientid:{}, 出错:{}", client_id, e);
+                                            clients.remove(&client_id);
+                                            break;
                                         }
                                     } else {
-                                        warn!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
+                                        info!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
                                     }
                                 }
                                 _ => {
@@ -316,20 +318,15 @@ impl Server for KCPServer {
     async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
         
         let config = tokio_kcp::KcpConfig {
-            mtu: 1400,
-            nodelay: tokio_kcp::KcpNoDelayConfig{
-                nodelay: true,
-                interval: 30,
-                resend: 2,
-                nc: false,
-            },
+            nodelay: tokio_kcp::KcpNoDelayConfig::fastest(),
 
+            mtu: 1400,
             wnd_size: (1024, 1024),
-            session_expire: std::time::Duration::from_secs(90),
+            session_expire: std::time::Duration::from_secs(30),
             flush_write: true,
             flush_acks_input: false,
             stream: false,
-            allow_recv_empty_packet: false,
+            allow_recv_empty_packet: true,
         };
 
         let mut listener = tokio_kcp::KcpListener::bind(
@@ -364,9 +361,11 @@ impl Server for KCPServer {
                                     if let Some(client_connection) = clients.get(&client_id) {
                                         if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
                                             error!("write_all clientid:{}, 出错:{}", client_id, e);
+                                            clients.remove(&client_id);
+                                            break;
                                         }
                                     } else {
-                                        warn!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
+                                        info!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
                                     }
                                 }
                                 _ => {

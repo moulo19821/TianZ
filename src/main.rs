@@ -88,6 +88,7 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
+#[allow(unused_variables)]
 #[cfg(target_os = "windows")]
 fn set_process_priority(high_priority: bool) -> Result<(), Error> {
 

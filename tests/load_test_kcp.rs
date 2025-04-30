@@ -14,7 +14,7 @@ use tokio_kcp::{KcpConfig, KcpStream};
 
 
 const CONCURRENT_REQUESTS: usize = 16;
-const TOTAL_REQUESTS: usize = 320000;
+const TOTAL_REQUESTS: usize = 1600000;
 
 fn parse_null_terminated(bytes: &[u8]) -> &str {
     // 找到第一个 `0` 的位置，截取之前的部分
@@ -52,6 +52,7 @@ async fn load_test_kcp() {
                 allow_recv_empty_packet: false,
             };
 
+            //let server_addr = "192.168.50.79:3100".parse::<SocketAddr>().unwrap();
             let server_addr = "127.0.0.1:3100".parse::<SocketAddr>().unwrap();
             let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
 
@@ -70,6 +71,8 @@ async fn load_test_kcp() {
                 let mut buffer = vec![0; 128];
                 stream.read(&mut buffer).await.unwrap();                 
             }
+
+            drop(stream)
         }));
     }
 
