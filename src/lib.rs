@@ -291,97 +291,23 @@ async fn handle_signal() {
 
 //////////////////////////////////////////////////////////////////////////////////////////////
 
+// struct KcpClientConnection {
+//     client_id: usize, 
+//     addr: std::net::SocketAddr,
+//     writer: Option<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
+//     reader: Arc<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
+//     runtime: std::sync::Arc<tokio::runtime::Runtime>,
+//     request_sender: mpsc::Sender<NetworkMessage>,
+//     clients: Arc<DashMap<usize, KcpClientConnection>>,
+// }
 struct KcpClientConnection {
-    client_id: usize, 
     addr: std::net::SocketAddr,
-    writer: Option<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
-    reader: Arc<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
-    runtime: std::sync::Arc<tokio::runtime::Runtime>,
-    request_sender: mpsc::Sender<NetworkMessage>,
-    clients: Arc<DashMap<usize, KcpClientConnection>>,
-}
-
-impl KcpClientConnection {
-    pub fn new(client_id: usize, addr: std::net::SocketAddr, reader: tokio_kcp::KcpStream, 
-        runtime: std::sync::Arc<tokio::runtime::Runtime>, request_sender: mpsc::Sender<NetworkMessage>, clients: Arc<DashMap<usize, KcpClientConnection>>) -> KcpClientConnection {
-        KcpClientConnection {
-            client_id, 
-            addr, 
-            writer: None, 
-            reader: Arc::new(tokio::sync::Mutex::new(reader)),
-            runtime, 
-            request_sender,
-            clients: Arc::new(DashMap::new()),
-        }
-    }
-
-    pub async fn init(&self) {
-        let mut buffer = [0u8; 32];
-        let n = self.reader.lock().await.read(&mut buffer).await.unwrap();
-        if n == 0 {
-            //TODO 消息不合法，清理
-        }
-        info!("收到Sync消息，正在解析{}", std::str::from_utf8(&buffer).unwrap());
-        let prefix = b"Sync|";
-        if buffer.starts_with(prefix) {
-            let msg = format!("SyncAck|{}", self.client_id);
-            info!("正在发送SyncAck|: {}", msg);
-            self.reader.lock().await.write_all(msg.as_bytes()).await.unwrap();
-        } else {
-            //TODO 消息不合法，清理
-        }
-    }
-
-    pub fn set_writer(&mut self, writer: tokio_kcp::KcpStream) {
-        self.writer = Some(tokio::sync::Mutex::new(writer));
-    }
-
-    pub async fn write_all(&self, data: &[u8]) -> io::Result<()> {
-        self.writer.as_ref().unwrap().lock().await.write_all(data).await
-    }
-
-    pub fn run(&mut self) {
-        let client_id = self.client_id;
-        let reader = Arc::clone(&self.reader);
-        let request_sender = self.request_sender.clone();
-        let runtime = self.runtime.clone();
-        
-        runtime.spawn(async move {
-            let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
-            loop {
-                let mut reader_guard = reader.lock().await;
-                match b.read_frame_from_kcp(&mut *reader_guard).await {
-                    Ok(Some(message)) => {
-                        // 使用提取的函数处理消息
-                        if let Err(err) = process_frame_message(&message, client_id, &request_sender).await {
-                            match *err.downcast_ref::<MyError>().unwrap() {
-                                // 对于关键错误，断开连接
-                                MyError::SendRequestFailed() => break,
-                                _ => continue,
-                            }
-                        }
-                    },
-                    Ok(None) => {
-                        info!("客户端正常关闭, client:{}, 关闭socket: 协程退出", client_id);
-                        break;
-                    },
-                    Err(e) => {
-                        error!("客户端异常关闭, client:{}, 关闭socket, Err:{e} 协程退出", client_id);
-                        break;
-                    }
-                }
-            }
-
-            trace!("read frame client:{} 协程退出", client_id);
-            return;
-        });
-    }
+    writer: tokio::sync::Mutex<tokio::io::WriteHalf<KcpStream>>,
 }
 
 pub struct KCPServer {
     clients: Arc<DashMap<usize, KcpClientConnection>>,
-    addr_read: String,
-    addr_write: String,
+    addr: String,
     client_ids: Arc<AtomicUsize>,
 }
 
@@ -390,15 +316,15 @@ impl Server for KCPServer {
     async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
         
         let config = tokio_kcp::KcpConfig {
-            mtu: 470,
+            mtu: 1400,
             nodelay: tokio_kcp::KcpNoDelayConfig{
                 nodelay: true,
-                interval: 10,
+                interval: 30,
                 resend: 2,
                 nc: false,
             },
 
-            wnd_size: (32, 32),
+            wnd_size: (1024, 1024),
             session_expire: std::time::Duration::from_secs(90),
             flush_write: true,
             flush_acks_input: false,
@@ -406,13 +332,10 @@ impl Server for KCPServer {
             allow_recv_empty_packet: false,
         };
 
-        let mut read_listener = tokio_kcp::KcpListener::bind(
-            config, self.addr_read.clone()).await.unwrap();
-
-        let mut write_listener = tokio_kcp::KcpListener::bind(
-            config, self.addr_write.clone()).await.unwrap();
+        let mut listener = tokio_kcp::KcpListener::bind(
+            config, self.addr.clone()).await.unwrap();
         
-        info!("KCP服务器启动成功,  监听read端口:{}  write端口:{}", self.addr_read, self.addr_write);
+        info!("KCP服务器启动成功,  监听read端口:{}", self.addr);
 
         let (shutdown_sender, _) = broadcast::channel(1);
 
@@ -439,7 +362,7 @@ impl Server for KCPServer {
                             match result {
                                 Some(NetworkMessage::Response { client_id, data }) => {
                                     if let Some(client_connection) = clients.get(&client_id) {
-                                        if let Err(e) = client_connection.write_all(data.to_bytes().as_ref()).await {
+                                        if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
                                             error!("write_all clientid:{}, 出错:{}", client_id, e);
                                         }
                                     } else {
@@ -471,49 +394,61 @@ impl Server for KCPServer {
         rt.spawn(async move {
             loop {
                 tokio::select! {
-                    result = read_listener.accept() => {
+                    result = listener.accept() => {
                         if let Ok((socket, addr)) = result {
     
                             let client_id = client_id.fetch_add(1, Ordering::SeqCst);
                             info!("新连接: {:?}, {}，当前共有{}个客户端", addr, client_id, clients.len());
-                            
-                            let client_connection = KcpClientConnection::new(
-                                client_id, addr.clone(), socket, Arc::clone(&rt1), request_sender.clone(), clients.clone());
 
-                            //给前端发送Sync消息，附带客户端的ID
-                            client_connection.init().await;
+                            let (mut read_half, write_half) = tokio::io::split(socket);
+                            
+                            let client_connection = KcpClientConnection{
+                                addr: addr,
+                                writer: tokio::sync::Mutex::new(write_half),
+                            };
 
                             clients.insert(client_id, client_connection);
+
+                            let request_sender = request_sender.clone();
+    
+                            let clientx = clients.clone();
+
+                            rt1.spawn(async move {
+                                
+                                let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
+                                
+                                loop {
+                                    match b.read_frame_from_kcp(&mut read_half).await {
+                                        Ok(Some(message)) => {
+                                            // 使用提取的函数处理消息
+                                            if let Err(err) = process_frame_message(&message, client_id, &request_sender).await {
+                                                match *err.downcast_ref::<MyError>().unwrap() {
+                                                    // 对于关键错误，断开连接
+                                                    MyError::SendRequestFailed() => break,
+                                                    _ => continue,
+                                                }
+                                            }
+                                        },
+                                        Ok(None) => {
+                                            info!("客户端正常关闭, client:{client_id}, 关闭socket: 协程退出");
+                                            break;
+                                        },
+                                        Err(e) => {
+                                            error!("客户端异常关闭, client:{client_id}, 关闭socket, Err:{e} 协程退出");
+                                            break;
+                                        }
+                                    }
+                                }
+    
+                                trace!("read frame client:{client_id} 协程退出");
+                                clientx.remove(&client_id);
+                                return;
+                            });
                         } else {
                             error!("accept 失败，退出");
                             return;
                         }
                     }
-
-
-                    result = write_listener.accept() => {
-                        if let Ok((mut socket, addr)) = result {
-                            //第一个接受的肯定是验证数据
-                            let mut buffer = [0u8; 128];
-                            let n = socket.read(&mut buffer).await.unwrap();
-                            if n == 0 {
-                                //TODO 消息不合法，清理
-                            }
-
-                            let prefix = b"Ack|";
-                            if buffer.starts_with(prefix) {
-
-                                let client_id_string = parse_null_terminated(&buffer[prefix.len()..]);
-                                let client_id = client_id_string.parse::<usize>().unwrap();
-                                let mut kcpClientConnection = clients.get_mut(&client_id).unwrap();
-                                kcpClientConnection.set_writer(socket);
-                                //成功设置以后，kcp才可以工作
-                                kcpClientConnection.run();
-                            }
-                        }
-                    }
-
-
 
                     _ = s_receiver.recv() => {
                         info!("listener.accept received shutdown signal, exit");
@@ -582,11 +517,10 @@ impl Server for KCPServer {
 
 impl KCPServer {
 
-    pub async fn new(addr_read: &str, addr_write: &str) -> Self {
+    pub async fn new(addr: &str) -> Self {
         KCPServer {
             clients: Arc::new(DashMap::new()),
-            addr_read: addr_read.to_string(),
-            addr_write: addr_write.to_string(),
+            addr: addr.to_string(),
             client_ids: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -799,7 +733,7 @@ pub struct C2M_PingHandler;
 impl C2M_PingHandler  {
     async fn run(&self, _request: &C2M_PingRequest, _response: &mut C2M_PingResponse)  {
         _response.count += 1;
-        //trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
+        trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
     }
 }
 
@@ -888,9 +822,9 @@ impl ProtocolParser {
         }
     }
 
-    pub async fn read_frame_from_kcp(
+    pub async fn read_frame_from_kcp<R: AsyncReadExt + Unpin>(
         &mut self,
-        reader: &mut tokio_kcp::KcpStream,
+        reader: &mut R,
     ) -> io::Result<Option<&[u8]>> {
         self.consume_pending(); // 先消费之前的数据
 
