@@ -19,11 +19,12 @@ mod net;
 mod my_future;
 
 use entity::root::Root;
-
+use TiangZ::Server;
 
 
 
 lazy_static::lazy_static! {
+    //pub static ref WORK_THREAD_NUM: usize = 8;
     pub static ref WORK_THREAD_NUM: usize = std::thread::available_parallelism().unwrap().get();
     pub static ref QUEUE_LEN: usize = 100_000;
     pub static ref BENCHMARK_VALUE: i64 = 0;
@@ -58,18 +59,32 @@ async fn main() -> io::Result<()> {
     let root = Root::instance();
     root.run().await;
     
-    // 启动网络服务器
-    let server = TiangZ::KCPServer::new("0.0.0.0:3100", "0.0.0.0:3101").await;
-    
-    // 运行服务器
-    tokio::select! {
-        _ = server.run(*WORK_THREAD_NUM, *QUEUE_LEN) => {
+    let mut server: Option<Box<dyn Server>> = Option::None;
+    if args.proto == "tcp" {
+        server = Some(Box::new(TiangZ::TCPServer::new("0.0.0.0:8080").await));
+    } else if args.proto == "kcp" {
+        server = Some(Box::new(TiangZ::KCPServer::new("0.0.0.0:3100", "0.0.0.0:3101").await));
+    }
 
+    match server {
+        Some(server) => {
+            tokio::select! {
+                _ = server.run(*WORK_THREAD_NUM, *QUEUE_LEN) => {
+        
+                }
+                // _ = sleep(Duration::from_secs(7)) => {
+        
+                // }
+            }
         }
-        _ = sleep(Duration::from_secs(7)) => {
+
+        None => {
 
         }
     }
+    
+    // 运行服务器
+    
     Ok(())
 }
 
@@ -136,6 +151,8 @@ struct Args {
     /// 设置日志级别 (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log: String,
+    #[arg(short, long, default_value = "tcp")]
+    proto: String,
 }
 
 fn init_logging(log_level: &str) {

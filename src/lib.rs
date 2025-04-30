@@ -29,6 +29,7 @@ mod my_future;
 use crate::errors::my_errors::RetResult;
 use crate::errors::my_errors::MyError;
 
+
 //////////////////////////////////////////////////////////////////////////////////////////////
 type TcpListener = tokio::net::TcpListener;  
 
@@ -71,27 +72,25 @@ pub enum NetworkMessage {
     //Shutdown,
 }
 
+#[async_trait]
+pub trait Server {
+    async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()>;
+}
+
 struct ClientConnection {
     addr: std::net::SocketAddr,
     writer: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
 }
 
-pub struct Server {
+pub struct TCPServer {
     clients: Arc<DashMap<usize, ClientConnection>>,
     addr: String,
     client_id: Arc<AtomicUsize>,
 }
 
-impl Server {
-    pub async fn new(addr: &str) -> Self {
-        Server {
-            clients: Arc::new(DashMap::new()),
-            addr: addr.to_string(),
-            client_id: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    pub async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()>{
+#[async_trait]
+impl Server for TCPServer {
+    async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()>{
 
         let listener = TcpListener::bind(&self.addr).await?;
 
@@ -271,6 +270,18 @@ impl Server {
         Ok(())
         //ETTask::complete().await; 
     }
+
+}
+
+impl TCPServer {
+    pub async fn new(addr: &str) -> Self {
+        TCPServer {
+            clients: Arc::new(DashMap::new()),
+            addr: addr.to_string(),
+            client_id: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
 }
 
 
@@ -374,18 +385,9 @@ pub struct KCPServer {
     client_ids: Arc<AtomicUsize>,
 }
 
-impl KCPServer {
-
-    pub async fn new(addr_read: &str, addr_write: &str) -> Self {
-        KCPServer {
-            clients: Arc::new(DashMap::new()),
-            addr_read: addr_read.to_string(),
-            addr_write: addr_write.to_string(),
-            client_ids: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-    
-    pub async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
+#[async_trait]
+impl Server for KCPServer {
+    async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
         
         let config = tokio_kcp::KcpConfig {
             mtu: 470,
@@ -575,6 +577,20 @@ impl KCPServer {
         Ok(())
         //ETTask::complete().await; 
     }
+
+}
+
+impl KCPServer {
+
+    pub async fn new(addr_read: &str, addr_write: &str) -> Self {
+        KCPServer {
+            clients: Arc::new(DashMap::new()),
+            addr_read: addr_read.to_string(),
+            addr_write: addr_write.to_string(),
+            client_ids: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    
 }
 
 
@@ -728,7 +744,7 @@ pub struct C2M_MoveToMessageHandler;
 
 impl C2M_MoveToMessageHandler  {
     async fn run(&self, _request: &C2M_MoveToMessage)  {
-        trace!("C2M_MoveToMessage");
+        //trace!("C2M_MoveToMessage");
     }
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -753,7 +769,7 @@ pub struct C2M_GetPlayerInfoHandler;
 
 impl C2M_GetPlayerInfoHandler  {
     async fn run(&self, _request: &C2M_GetPlayerInfoRequest, _response: &mut M2C_GetPlayerInfoResponse)  {
-        trace!("正在处理C2M_GetPlayerInfoRequest, rpc_id:{}", _request.get_rpc_id());
+        //trace!("正在处理C2M_GetPlayerInfoRequest, rpc_id:{}", _request.get_rpc_id());
         //if request.player_id == 0 {
             //error!("C2M_GetPlayerInfoRequest的请求参数player_id为0，请求不合法");
         //    response.error = 1;
@@ -783,7 +799,7 @@ pub struct C2M_PingHandler;
 impl C2M_PingHandler  {
     async fn run(&self, _request: &C2M_PingRequest, _response: &mut C2M_PingResponse)  {
         _response.count += 1;
-        trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
+        //trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
     }
 }
 

@@ -3,12 +3,13 @@ use TiangZ; // 你的crate名
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use bytes::{BytesMut, BufMut};
+use TiangZ::Server;
 
 #[tokio::test]
 async fn test_server_response() {
     // 启动测试服务器
     let server_handle = tokio::spawn( async {
-        let server = TiangZ::Server::new("0.0.0.0:8080").await;
+        let server = TiangZ::TCPServer::new("0.0.0.0:8080").await;
         server.run(8, 10000).await.unwrap();
     });
     

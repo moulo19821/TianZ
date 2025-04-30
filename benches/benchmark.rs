@@ -2,6 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use tokio::runtime::Runtime;
 use bytes::{BytesMut, BufMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};  // 添加这行
+use TiangZ::Server;
 
 lazy_static::lazy_static! {
     pub static ref WORK_THREAD_NUM: usize = std::thread::available_parallelism().unwrap().get();
@@ -32,7 +33,7 @@ fn bench_server(c: &mut Criterion) {
     // 启动测试服务器 (使用move取得所有权)
     std::thread::spawn(move || {
         let _ = server_rt.block_on(async {
-            let server = TiangZ::Server::new("127.0.0.1:8080").await;
+            let server = TiangZ::TCPServer::new("127.0.0.1:8080").await;
             server.run(*WORK_THREAD_NUM, *QUEUE_LEN).await.unwrap();
         });
     });
