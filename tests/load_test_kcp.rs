@@ -14,7 +14,7 @@ use tokio_kcp::{KcpConfig, KcpStream};
 
 
 const CONCURRENT_REQUESTS: usize = 16;
-const TOTAL_REQUESTS: usize = 1600000;
+const TOTAL_REQUESTS: usize = 160000;
 
 fn parse_null_terminated(bytes: &[u8]) -> &str {
     // 找到第一个 `0` 的位置，截取之前的部分

@@ -26,10 +26,11 @@ mod errors;
 mod struct_macro;
 mod et_event;
 mod my_future;
+mod protocol_parser;
+
 use crate::errors::my_errors::RetResult;
 use crate::errors::my_errors::MyError;
-
-
+use protocol_parser::ProtocolParser;
 //////////////////////////////////////////////////////////////////////////////////////////////
 type TcpListener = tokio::net::TcpListener;  
 
@@ -702,7 +703,7 @@ pub struct C2M_GetPlayerInfoHandler;
 
 impl C2M_GetPlayerInfoHandler  {
     async fn run(&self, _request: &C2M_GetPlayerInfoRequest, _response: &mut M2C_GetPlayerInfoResponse)  {
-        //trace!("正在处理C2M_GetPlayerInfoRequest, rpc_id:{}", _request.get_rpc_id());
+        trace!("正在处理C2M_GetPlayerInfoRequest, rpc_id:{}", _request.get_rpc_id());
         //if request.player_id == 0 {
             //error!("C2M_GetPlayerInfoRequest的请求参数player_id为0，请求不合法");
         //    response.error = 1;
@@ -722,7 +723,7 @@ create_actorLocationRpcResponse! {
         count: i64,
     }
 }
-////////////////////////////以下这段，是开发者自己增加的，在于生成一个处理请求和返回的Handler////////////
+////////////////////////////以下这段，是开发者自己增加的，在于生成一个处理请求和返回的Handler//////////////
 #[allow(non_camel_case_types)]
 #[derive(IActorLocationRpcHandler, Default)]
 #[ResponseType(C2M_PingResponse)]
@@ -735,132 +736,7 @@ impl C2M_PingHandler  {
         trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
     }
 }
-
-#[derive(Debug)]
-pub struct ProtocolParser {
-    buffer: BytesMut,
-    max_frame_size: usize,
-    pending_consume: usize, // 新增：跟踪待消费的字节数
-}
-
-impl ProtocolParser {
-    pub fn new() -> Self {
-        Self {
-            buffer: BytesMut::with_capacity(32 * 1024),
-            max_frame_size: 2 * 1024,
-            pending_consume: 0,
-        }
-    }
-
-    pub fn with_max_frame_size(mut self, size: usize) -> Self {
-        self.max_frame_size = size;
-        self.buffer.reserve(size * 128);
-        self
-    }
-
-    /// 内部方法：消费待处理的数据
-    fn consume_pending(&mut self) {
-        if self.pending_consume > 0 {
-            self.buffer.advance(self.pending_consume);
-            self.pending_consume = 0;
-        }
-    }
-
-    /// 解析帧数据，返回帧的长度
-    fn parse_frame_length(&self) -> io::Result<Option<usize>> {
-        // 检查长度头是否完整
-        if self.buffer.len() < 2 {
-            return Ok(None);
-        }
-
-        // 读取长度头
-        let len = {
-            let len_bytes = &self.buffer[..2];
-            i16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize
-        };
-
-        // 验证帧长度
-        if len > self.max_frame_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Frame size {} exceeds limit {}", len, self.max_frame_size),
-            ));
-        }
-
-        // 检查帧数据是否完整
-        if self.buffer.len() < 2 + len {
-            return Ok(None);
-        }
-
-        Ok(Some(len))
-    }
-
-    /// 异步读取完整帧
-    pub async fn read_frame<R: AsyncReadExt + Unpin>(
-        &mut self,
-        reader: &mut R,
-    ) -> io::Result<Option<&[u8]>> {
-        self.consume_pending(); // 先消费之前的数据
-
-        loop {
-            match self.parse_frame_length()? {
-                Some(len) => {
-                    // 获取帧数据引用
-                    let frame = &self.buffer[2..2 + len];
-                    // 记录待消费的字节数（2字节头 + 数据长度）
-                    self.pending_consume = 2 + len;
-                    return Ok(Some(frame));
-                }
-                None => {
-                    // 需要更多数据
-                    if reader.read_buf(&mut self.buffer).await? == 0 {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-    }
-
-    pub async fn read_frame_from_kcp<R: AsyncReadExt + Unpin>(
-        &mut self,
-        reader: &mut R,
-    ) -> io::Result<Option<&[u8]>> {
-        self.consume_pending(); // 先消费之前的数据
-
-        loop {
-            match self.parse_frame_length()? {
-                Some(len) => {
-                    // 获取帧数据引用
-                    let frame = &self.buffer[2..2 + len];
-                    // 记录待消费的字节数（2字节头 + 数据长度）
-                    self.pending_consume = 2 + len;
-                    return Ok(Some(frame));
-                }
-                None => {
-                    let mut temp_buff = [0u8; 128];
-                    tokio::select! {
-                        ret = reader.read(&mut temp_buff) => {
-                            let n = ret?;
-                            if n == 0 {
-                                return Ok(None);
-                            } else {
-                                // 需要更多数据
-                                self.buffer.extend_from_slice(&temp_buff[..n]);
-                                continue;
-                            }
-                        }   
-                    }
-                }
-            }
-        }
-    }
-
-    /// 获取当前缓冲区状态
-    pub fn buffer_stats(&self) -> (usize, usize) {
-        (self.buffer.len(), self.buffer.capacity())
-    }
-}
-
+///////////////////////////////////////////////////////////////////////////////////////////////////
 pub async fn  process_message_msgpack(data: Arc<Box<dyn IMessage>>, 
     client_id: usize, 
     sender: std::option::Option<&mpsc::Sender<NetworkMessage>>){
@@ -933,13 +809,6 @@ async fn process_frame_message(
     
     Ok(())
 }
-
-fn parse_null_terminated(bytes: &[u8]) -> &str {
-    // 找到第一个 `0` 的位置，截取之前的部分
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..end]).unwrap() // 安全：已知有效 UTF-8
-}
-
 
 #[cfg(test)]
 mod tests {
