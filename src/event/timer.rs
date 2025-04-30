@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// #![allow(dead_code)]
 
 // use std::fmt::Debug;
 // use std::time::Duration;
@@ -241,11 +241,11 @@
 
 // inventory::collect!(TimerEventHandlerFactory);
 
-#[cfg(test)]
-mod main_tests {
-    use super::*;
+// #[cfg(test)]
+// mod main_tests {
+//     use super::*;
 
-    #[tokio::test]
-    async fn test_timer_actor() {
-    }
-}
+//     #[tokio::test]
+//     async fn test_timer_actor() {
+//     }
+// }

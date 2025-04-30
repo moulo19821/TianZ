@@ -14,13 +14,8 @@ use tokio_kcp::{KcpConfig, KcpStream};
 
 
 const CONCURRENT_REQUESTS: usize = 16;
-const TOTAL_REQUESTS: usize = 160000;
+const TOTAL_REQUESTS: usize = 1600000;
 
-fn parse_null_terminated(bytes: &[u8]) -> &str {
-    // 找到第一个 `0` 的位置，截取之前的部分
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..end]).unwrap() // 安全：已知有效 UTF-8
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn load_test_kcp() {
@@ -36,16 +31,11 @@ async fn load_test_kcp() {
         handles.push(tokio::spawn(async move {
 
             let config = tokio_kcp::KcpConfig {
-                mtu: 1400,
-                nodelay: tokio_kcp::KcpNoDelayConfig{
-                    nodelay: true,
-                    interval: 30,
-                    resend: 2,
-                    nc: false,
-                },
+                mtu: 470,
+                nodelay: tokio_kcp::KcpNoDelayConfig::fastest(),
 
-                wnd_size: (1024, 1024),
-                session_expire: std::time::Duration::from_secs(90),
+                wnd_size: (256, 256),
+                session_expire: std::time::Duration::from_secs(30),
                 flush_write: true,
                 flush_acks_input: false,
                 stream: false,
