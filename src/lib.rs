@@ -27,6 +27,7 @@ mod struct_macro;
 mod et_event;
 mod my_future;
 mod protocol_parser;
+mod kcp_wrapper;
 
 use crate::errors::my_errors::RetResult;
 use crate::errors::my_errors::MyError;
