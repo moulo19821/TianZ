@@ -721,7 +721,7 @@ create_actorLocationRpcRequest! {
 
 create_actorLocationRpcResponse! {
     pub struct C2M_PingResponse {
-        count: i64,
+        //count: i64,
     }
 }
 ////////////////////////////以下这段，是开发者自己增加的，在于生成一个处理请求和返回的Handler//////////////
@@ -733,7 +733,7 @@ pub struct C2M_PingHandler;
 
 impl C2M_PingHandler  {
     async fn run(&self, _request: &C2M_PingRequest, _response: &mut C2M_PingResponse)  {
-        _response.count += 1;
+        //_response.count += 1;
         trace!("正在处理C2M_PingRequest, rpc_id:{}", _request.get_rpc_id());
     }
 }
