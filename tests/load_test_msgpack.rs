@@ -1,13 +1,22 @@
+#![allow(unused_imports)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use bytes::{BytesMut, BufMut};
+use TiangZ::IMessage;
 use std::sync::atomic::AtomicI32;
 use std::time::Instant;
 use serde::Serialize;
 
 use std::sync::{Arc, atomic::Ordering};
 
+#[cfg(debug_assertions)]
+const CONCURRENT_REQUESTS: usize = 1;
+#[cfg(debug_assertions)]
+const TOTAL_REQUESTS: usize = 10;
+
+#[cfg(not(debug_assertions))]
 const CONCURRENT_REQUESTS: usize = 128;
+#[cfg(not(debug_assertions))]
 const TOTAL_REQUESTS: usize = 1280000;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -18,28 +27,33 @@ async fn load_test_msgpack() {
     let rpc_id = Arc::new(AtomicI32::new(0));
     for _ in 0..CONCURRENT_REQUESTS {
 
-
-        let rpc_id = rpc_id.clone();
-
         handles.push(tokio::spawn(async move {
-            let mut stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-
-            let rpc_id = rpc_id.fetch_add(1, Ordering::SeqCst);
+            let stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
 
             let mut ping_msg = Vec::new();
-            TiangZ::C2M_PingRequest{rpc_id, _t: "C2M_PingRequest".to_string()}
+            TiangZ::C2M_PingRequest{rpc_id:1, _t: "C2M_PingRequest".to_string()}
                 .serialize(&mut rmp_serde::Serializer::new(&mut ping_msg).with_struct_map()).unwrap();
+
+            let ping_res_msg = TiangZ::C2M_PingResponse::default().to_bytes();
 
             let mut buf = BytesMut::with_capacity(2 + ping_msg.len());
             buf.put_u16(ping_msg.len() as u16);
             buf.put_slice(&ping_msg);
 
+            let (rx, mut wx) = stream.into_split();
             for _ in 0..TOTAL_REQUESTS/CONCURRENT_REQUESTS {
-                stream.write_all(&buf).await.unwrap();
-                
-                let mut response = vec![0; 128];
-                let _ = stream.read(&mut response).await.unwrap();
+                wx.write_all(&buf).await.unwrap();
             }
+
+            let reader = Arc::new(tokio::sync::Mutex::new(rx));
+            let reader1 = reader.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut response = Vec::with_capacity((ping_res_msg.len()+2) * TOTAL_REQUESTS/CONCURRENT_REQUESTS);
+                let _ = reader1.lock().await.read_exact(&mut response).await.unwrap();
+            });
+            
+            let _ = tokio::join!(handle);
         }));
     }
     
