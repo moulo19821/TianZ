@@ -62,9 +62,9 @@ async fn main() -> io::Result<()> {
     let mut server: Option<Box<dyn Server>> = Option::None;
     if args.proto == "tcp" {
         server = Some(Box::new(TiangZ::TCPServer::new("0.0.0.0:8080").await));
-    } else if args.proto == "kcp" {
-        server = Some(Box::new(TiangZ::KCPServer::new("0.0.0.0:3100").await));
-    }
+    }// else if args.proto == "kcp" {
+    //    server = Some(Box::new(TiangZ::KCPServer::new("0.0.0.0:3100").await));
+    //}
 
     match server {
         Some(server) => {

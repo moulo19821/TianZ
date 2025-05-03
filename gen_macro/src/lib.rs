@@ -730,7 +730,7 @@ pub fn entity(input: TokenStream) -> TokenStream {
     do_expend(input, "")
 }
 
-fn get_field_default(fields: &StructFields) -> Vec<proc_macro2::TokenStream> {
+fn get_field_default(struct_name: String, fields: &StructFields) -> Vec<proc_macro2::TokenStream> {
     fields.iter()
     .filter(|f| {
         let ident_name = format!("{}", f.ident.as_ref().unwrap());
@@ -739,7 +739,13 @@ fn get_field_default(fields: &StructFields) -> Vec<proc_macro2::TokenStream> {
     .map(|f| {
         let ident = &f.ident;
         let ty = &f.ty;
-        quote! { #ident: #ty::default() }
+
+        let ident_name = format!("{}", f.ident.as_ref().unwrap());
+        if ident_name == "_t" {
+            quote! { #ident: String::from(#struct_name) }
+        } else {
+            quote! { #ident: #ty::default() }
+        }
     })
     .collect()
 }
@@ -811,8 +817,9 @@ fn impl_imessage(input: &DeriveInput) -> proc_macro2::TokenStream {
             fn get_type_name(&self) -> &str {
                 self._t.as_str()
             }
-            fn to_bytes(&self) -> Vec<u8> {
-                rmp_serde::to_vec_named(&self).unwrap()
+            fn to_bytes(&self, buf: &mut bytes::BytesMut) {
+                let mut writer = buf.writer();
+                rmp_serde::encode::write_named(&mut writer, self).unwrap();
             }
             fn to_json_string(&self) -> String {
                 serde_json::to_string(self).unwrap()
@@ -875,7 +882,8 @@ pub fn IActorLocationRpcRequest(input: TokenStream) -> TokenStream {
     let fields = get_fields_from_derive_input(&input).unwrap();
 
     //获取字段与默认值
-    let fields_value_default= get_field_default(&fields);
+    let struct_name_string = format!("{}", &input.ident);
+    let fields_value_default= get_field_default(struct_name_string, &fields);
     
     let impl_imessage = impl_imessage(&input);
 
@@ -927,7 +935,8 @@ pub fn IActorLocationRpcResponse(input: TokenStream) -> TokenStream {
     let fields = get_fields_from_derive_input(&input).unwrap();
 
     //获取字段与默认值
-    let fields_value_default = get_field_default(&fields);
+    let struct_name_string = format!("{}", &input.ident);
+    let fields_value_default= get_field_default(struct_name_string, &fields);
 
     let impl_imessage = impl_imessage(&input);
 
@@ -990,17 +999,18 @@ pub fn IActorLocationRpcHandler(input: TokenStream) -> TokenStream {
 
         #[async_trait]
         impl IMActorHandler for #struct_name  {
-            async fn handle_message(&self, message: Arc<Box<dyn IMessage>>, client_id: usize, sender: std::option::Option<&mpsc::Sender<NetworkMessage>>)  {
+            async fn handle_message(&self, message: Arc<Box<dyn IMessage>>, client_id: usize, 
+                sender: std::option::Option<mpsc::Sender<NetworkMessage>>)  {
                 let v = message.as_ref().as_any().downcast_ref::<#request_type>().unwrap();
                 let mut response = #response_type::default();
                 self.handler(v, &mut response).await;
                 if let Some(sender) = sender {
                     if let Err(e) = sender.send(NetworkMessage::Response { 
                         client_id, data: std::sync::Arc::new(std::boxed::Box::new(response))})
-                    .await {
+                .await {
                         error!("IMActorHandler handle_message 发送消息失败, {}", e);
                     };
-                };
+                }
             }
         }
 
@@ -1031,7 +1041,8 @@ pub fn IActorLocationMessageRequest(input: TokenStream) -> TokenStream {
     let fields = get_fields_from_derive_input(&input).unwrap();
 
     //获取字段与默认值
-    let fields_value_default= get_field_default(&fields);
+    let struct_name_string = format!("{}", &input.ident);
+    let fields_value_default= get_field_default(struct_name_string, &fields);
     
     let impl_imessage = impl_imessage(&input);
 
@@ -1083,7 +1094,8 @@ pub fn IActorLocationMessageHandler(input: TokenStream) -> TokenStream {
 
         #[async_trait]
         impl IMActorHandler for #struct_name  {
-            async fn handle_message(&self, message: Arc<Box<dyn IMessage>>, client_id: usize, sender: std::option::Option<&mpsc::Sender<NetworkMessage>>)  {
+            async fn handle_message(&self, message: Arc<Box<dyn IMessage>>, client_id: usize, 
+                sender: std::option::Option<mpsc::Sender<NetworkMessage>>)  {
                 let v = message.as_ref().as_any().downcast_ref::<#request_type>().unwrap();
                 self.handler(v).await;
             }

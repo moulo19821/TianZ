@@ -43,13 +43,14 @@ core_affinity = "0.8.3"
 once_cell = "1.18"
 futures = "0.3.31"
 tokio_kcp = "0.9.8"
+object-pool = "0.6"
 #kcp-rust-native = "0.1.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32", "Win32_System_Threading", "Win32_Foundation"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = "0.29"  # 用于与Linux系统交互
+nix = "0.30"  # 用于与Linux系统交互
 
 [build-dependencies]
 rayon = "1.10"

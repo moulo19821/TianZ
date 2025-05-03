@@ -11,7 +11,7 @@ const TOTAL_REQUESTS: usize = 12800000;
 async fn load_test_message() {
     let start = Instant::now();
     let mut handles = vec![];
-    
+
     for _ in 0..CONCURRENT_REQUESTS {
         handles.push(tokio::spawn(async move {
             let mut stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();

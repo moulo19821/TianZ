@@ -6,18 +6,20 @@ use std::io;
 use std::future::pending;
 use std::any::Any;
 use std::thread;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, broadcast};
 use tokio::signal;
-use bytes::{BytesMut, Buf};
+use bytes::{BytesMut, BufMut, Buf};
 use dashmap::DashMap;
 use tokio::time::{sleep, Duration};
 use async_trait::async_trait;
 use tracing::{trace, error, info, warn, debug};
 use tokio_kcp::KcpStream;
+use object_pool::Pool;
 
 use gen_macro::{IActorLocationRpcHandler, IActorLocationRpcRequest, IActorLocationRpcResponse, 
     IActorLocationMessageRequest, IActorLocationMessageHandler, Singleton};
@@ -80,8 +82,88 @@ pub trait Server {
 }
 
 struct ClientConnection {
+    client_id: usize,
     addr: std::net::SocketAddr,
-    writer: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
+    writer: std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    msg_sender: mpsc::Sender<NetworkMessage>,
+    msg_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<NetworkMessage>>>,
+}
+
+lazy_static::lazy_static! {
+    static ref BYTES_MUT_POOL: Pool<BytesMut> = Pool::new(
+        1024, // 最大缓存1024个实例
+        || BytesMut::with_capacity(4096), // 默认分配4KB                          
+    );
+}
+
+impl ClientConnection {
+
+    pub fn new(client_id: usize, addr: std::net::SocketAddr, writer: std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>) -> Self {
+        let (sender, receiver) = mpsc::channel(1000);
+        ClientConnection {
+            client_id: client_id,
+            addr: addr,
+            writer: writer,
+            msg_sender: sender,
+            msg_receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+        }
+    }   
+
+    pub fn run(&mut self, 
+        rt: Arc<tokio::runtime::Runtime>,
+        clients: Arc<DashMap<usize, ClientConnection>>,
+    ) {
+
+        let socket_writer = self.writer.clone();
+        let client_id = self.client_id;
+
+        let receiver = self.msg_receiver.clone();
+        rt.spawn(async move {
+            //这个buff再重复使用，所以不存在内存反复分配释放问题
+            let mut buf = BytesMut::with_capacity(4096);
+            let mut start = Instant::now();
+            loop {
+                let mut receiver_guard = receiver.lock().await;
+                tokio::select! {
+                    result = receiver_guard.recv() => {
+                        match result {
+                            Some(NetworkMessage::Response { client_id, data }) => {
+
+                                data.to_bytes(&mut buf);
+
+
+                                // if let Err(e) = socket_writer.lock().await.write_all(data.to_bytes().as_ref()).await {
+                                //     error!("write_all clientid:{}, 出错:{}", client_id, e);
+                                //     clients.remove(&client_id);
+                                //     break;
+                                // }
+                            }
+                            _ => {
+                                trace!("通道已关闭，退出");
+                                break; // 连接关闭
+                            }
+                        }
+                    }
+
+                    result = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+
+                if buf.len() >= 1024 || start.elapsed().as_millis() >= 10 {
+                    if let Err(e) = socket_writer.lock().await.write_all(&buf).await {
+                        error!("write_all clientid:{}, 出错:{}", client_id, e);
+                        clients.remove(&client_id);
+                        break;
+                    }
+                    buf.clear();
+                    start = Instant::now();
+                }
+
+
+            }
+
+            clients.remove(&client_id);
+        });
+    }
 }
 
 pub struct TCPServer {
@@ -107,46 +189,46 @@ impl Server for TCPServer {
         .collect();
 
 
-        let senders: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
-        let receivers: Vec<_> = channels.into_iter().map(|(_, rx)| rx).collect();
+        //let senders: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
+        //let receivers: Vec<_> = channels.into_iter().map(|(_, rx)| rx).collect();
 
         let (request_sender, mut request_receiver) = mpsc::channel(queue_len * work_thead_num);
 
         //做工线程，从
-        let _: Vec<_> = receivers.into_iter().enumerate().map(|(_, mut rx)| {
-            let mut s_receiver = shutdown_sender.subscribe();
-            let clients = self.clients.clone();
-            rt.spawn(async move {
-                loop {
-                    tokio::select! {
-                        result = rx.recv() => {
-                            match result {
-                                Some(NetworkMessage::Response { client_id, data }) => {
-                                    if let Some(client_connection) = clients.get(&client_id) {
-                                        if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
-                                            error!("write_all clientid:{}, 出错:{}", client_id, e);
-                                            clients.remove(&client_id);
-                                            break;
-                                        }
-                                    } else {
-                                        info!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
-                                    }
-                                }
-                                _ => {
-                                    info!("通道已关闭，退出");
-                                    break; // 连接关闭
-                                }
-                            }
-                        }
-                        _ = s_receiver.recv() => {
-                            info!("client_connection.writer 收到退出消息，退出");
-                            break; // 退出循环
-                        }
-                    }
-                }
-            });
+        // let _: Vec<_> = receivers.into_iter().enumerate().map(|(_, mut rx)| {
+        //     let mut s_receiver = shutdown_sender.subscribe();
+        //     let clients = self.clients.clone();
+        //     rt.spawn(async move {
+        //         loop {
+        //             tokio::select! {
+        //                 result = rx.recv() => {
+        //                     match result {
+        //                         Some(NetworkMessage::Response { client_id, data }) => {
+        //                             if let Some(client_connection) = clients.get(&client_id) {
+        //                                 if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
+        //                                     error!("write_all clientid:{}, 出错:{}", client_id, e);
+        //                                     clients.remove(&client_id);
+        //                                     break;
+        //                                 }
+        //                             } else {
+        //                                 trace!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
+        //                             }
+        //                         }
+        //                         _ => {
+        //                             trace!("通道已关闭，退出");
+        //                             break; // 连接关闭
+        //                         }
+        //                     }
+        //                 }
+        //                 _ = s_receiver.recv() => {
+        //                     trace!("client_connection.writer 收到退出消息，退出");
+        //                     break; // 退出循环
+        //                 }
+        //             }
+        //         }
+        //     });
         
-        }).collect();
+        // }).collect();
         
         
         let clients = self.clients.clone();
@@ -166,10 +248,9 @@ impl Server for TCPServer {
 
                             let (mut reader, writer) = socket.into_split();
                             
-                            let client_connection = ClientConnection {
-                                addr: addr,
-                                writer: tokio::sync::Mutex::new(writer),
-                            };
+                            let mut client_connection = ClientConnection::new(client_id, addr, 
+                                Arc::new(tokio::sync::Mutex::new(writer)));
+                            client_connection.run(rt1.clone(), clients.clone());
                             clients.insert(client_id, client_connection);
     
                             let request_sender = request_sender.clone();
@@ -220,6 +301,7 @@ impl Server for TCPServer {
             }
         });
 
+        let clients = self.clients.clone();
 
         'outer: loop {
             
@@ -227,7 +309,8 @@ impl Server for TCPServer {
                 result = request_receiver.recv() => {
                     match result {
                         Some(NetworkMessage::Request { client_id, data }) => {
-                            process_message_msgpack(data, client_id, std::option::Option::Some(&senders[client_id%(work_thead_num)])).await;
+                            let msg_sender = clients.get(&client_id).map(|client| client.msg_sender.clone());
+                            process_message_msgpack(data, client_id, msg_sender).await;
                         }
                         Some(NetworkMessage::Message { data }) => {
                             process_message_msgpack(data, 0, std::option::Option::None).await;
@@ -294,242 +377,6 @@ async fn handle_signal() {
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////
-
-// struct KcpClientConnection {
-//     client_id: usize, 
-//     addr: std::net::SocketAddr,
-//     writer: Option<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
-//     reader: Arc<tokio::sync::Mutex<tokio_kcp::KcpStream>>,
-//     runtime: std::sync::Arc<tokio::runtime::Runtime>,
-//     request_sender: mpsc::Sender<NetworkMessage>,
-//     clients: Arc<DashMap<usize, KcpClientConnection>>,
-// }
-struct KcpClientConnection {
-    addr: std::net::SocketAddr,
-    writer: tokio::sync::Mutex<tokio::io::WriteHalf<KcpStream>>,
-}
-
-pub struct KCPServer {
-    clients: Arc<DashMap<usize, KcpClientConnection>>,
-    addr: String,
-    client_ids: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl Server for KCPServer {
-    async fn run(&self, work_thead_num: usize, queue_len: usize) -> io::Result<()> {
-        
-        let config = tokio_kcp::KcpConfig {
-            nodelay: tokio_kcp::KcpNoDelayConfig::fastest(),
-
-            mtu: 1400,
-            wnd_size: (1024, 1024),
-            session_expire: std::time::Duration::from_secs(30),
-            flush_write: true,
-            flush_acks_input: false,
-            stream: false,
-            allow_recv_empty_packet: true,
-        };
-
-        let mut listener = tokio_kcp::KcpListener::bind(
-            config, self.addr.clone()).await.unwrap();
-        
-        info!("KCP服务器启动成功,  监听read端口:{}", self.addr);
-
-        let (shutdown_sender, _) = broadcast::channel(1);
-
-        let rt = start_runtime(work_thead_num);
-
-        let channels: Vec<(mpsc::Sender<NetworkMessage>, mpsc::Receiver<NetworkMessage>)> = (0..work_thead_num)
-        .map(|_| mpsc::channel(queue_len))
-        .collect();
-
-
-        let senders: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
-        let receivers: Vec<_> = channels.into_iter().map(|(_, rx)| rx).collect();
-
-        let (request_sender, mut request_receiver) = mpsc::channel(queue_len * work_thead_num);
-
-        //做工线程，从
-        let _: Vec<_> = receivers.into_iter().enumerate().map(|(_, mut rx)| {
-            let mut s_receiver = shutdown_sender.subscribe();
-            let clients = self.clients.clone();
-            rt.spawn(async move {
-                loop {
-                    tokio::select! {
-                        result = rx.recv() => {
-                            match result {
-                                Some(NetworkMessage::Response { client_id, data }) => {
-                                    if let Some(client_connection) = clients.get(&client_id) {
-                                        if let Err(e) = client_connection.writer.lock().await.write_all(data.to_bytes().as_ref()).await {
-                                            error!("write_all clientid:{}, 出错:{}", client_id, e);
-                                            clients.remove(&client_id);
-                                            break;
-                                        }
-                                    } else {
-                                        info!("client_id:{} 不在clients中, 丢弃data:{}, 不写入socket中", client_id, data.to_json_string());
-                                    }
-                                }
-                                _ => {
-                                    info!("通道已关闭，退出");
-                                    break; // 连接关闭
-                                }
-                            }
-                        }
-                        _ = s_receiver.recv() => {
-                            info!("client_connection.writer 收到退出消息，退出");
-                            break; // 退出循环
-                        }
-                    }
-                }
-            });
-        
-        }).collect();
-        
-        
-        let clients = self.clients.clone();
-        let client_id = self.client_ids.clone();
-      
-        let mut s_receiver = shutdown_sender.subscribe();
-        let rt1 = rt.clone();
-        rt.spawn(async move {
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        if let Ok((socket, addr)) = result {
-    
-                            let client_id = client_id.fetch_add(1, Ordering::SeqCst);
-                            info!("新连接: {:?}, {}，当前共有{}个客户端", addr, client_id, clients.len());
-
-                            let (mut read_half, write_half) = tokio::io::split(socket);
-                            
-                            let client_connection = KcpClientConnection{
-                                addr: addr,
-                                writer: tokio::sync::Mutex::new(write_half),
-                            };
-
-                            clients.insert(client_id, client_connection);
-
-                            let request_sender = request_sender.clone();
-    
-                            let clientx = clients.clone();
-
-                            rt1.spawn(async move {
-                                
-                                let mut b = ProtocolParser::new().with_max_frame_size(10*1024);
-                                
-                                loop {
-                                    match b.read_frame_from_kcp(&mut read_half).await {
-                                        Ok(Some(message)) => {
-                                            // 使用提取的函数处理消息
-                                            if let Err(err) = process_frame_message(&message, client_id, &request_sender).await {
-                                                match *err.downcast_ref::<MyError>().unwrap() {
-                                                    // 对于关键错误，断开连接
-                                                    MyError::SendRequestFailed() => break,
-                                                    _ => continue,
-                                                }
-                                            }
-                                        },
-                                        Ok(None) => {
-                                            info!("客户端正常关闭, client:{client_id}, 关闭socket: 协程退出");
-                                            break;
-                                        },
-                                        Err(e) => {
-                                            error!("客户端异常关闭, client:{client_id}, 关闭socket, Err:{e} 协程退出");
-                                            break;
-                                        }
-                                    }
-                                }
-    
-                                trace!("read frame client:{client_id} 协程退出");
-                                clientx.remove(&client_id);
-                                return;
-                            });
-                        } else {
-                            error!("accept 失败，退出");
-                            return;
-                        }
-                    }
-
-                    _ = s_receiver.recv() => {
-                        info!("listener.accept received shutdown signal, exit");
-                        return; // 退出
-                    }
-                }
-            }
-        });
-
-
-        'outer: loop {
-            
-            tokio::select! {
-                result = request_receiver.recv() => {
-                    match result {
-                        Some(NetworkMessage::Request { client_id, data }) => {
-                            process_message_msgpack(data, client_id, std::option::Option::Some(&senders[client_id%(work_thead_num)])).await;
-                        }
-                        Some(NetworkMessage::Message { data }) => {
-                            process_message_msgpack(data, 0, std::option::Option::None).await;
-                        }
-                        _ => {
-                            error!("request_receiver 通道已关闭");
-                            break; // 连接关闭
-                        }
-                    }
-                }
-            
-                _result = signal::ctrl_c() => {
-                    info!("CTRL_C 被按下，服务器终止！");
-                    shutdown_sender.send(()).unwrap();
-                    break 'outer;
-                }
-
-                _result = handle_signal() => {
-                    info!("收到kill ，服务器终止！");
-                    shutdown_sender.send(()).unwrap();
-                    break 'outer;
-                }
-            }
-        }
-
-        shutdown_sender.send(()).unwrap();
-
-        sleep(Duration::from_secs(2)).await;
-
-        //终止创建的运行时
-        match Arc::try_unwrap(rt) {
-            Ok(rt) => rt.shutdown_background(),
-            Err(_) => eprintln!("Failed to shutdown: Runtime is still shared"),
-        }
-
-        // loop {
-        //     let rt = rt.clone();
-        //     match Arc::try_unwrap(rt) {
-        //         Ok(rt) => {rt.shutdown_background(); break;}
-        //         Err(_) => continue,
-        //     }
-        // }
-
-        Ok(())
-        //ETTask::complete().await; 
-    }
-
-}
-
-impl KCPServer {
-
-    pub async fn new(addr: &str) -> Self {
-        KCPServer {
-            clients: Arc::new(DashMap::new()),
-            addr: addr.to_string(),
-            client_ids: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-    
-}
-
-
-//////////////////////////////////////////////////////////////////////////////////////////////
 pub trait Singleton {
     fn instance() -> &'static Self;
 }
@@ -563,7 +410,7 @@ pub trait IMessage : Any + Send + Sync {
     fn with_serde_json_value(&self, message: serde_json::Value) -> RetResult<Box<dyn IMessage>>;
     fn as_any(&self) -> &dyn Any;
     fn get_type_name(&self) -> &str;
-    fn to_bytes(&self) -> Vec<u8>;
+    fn to_bytes(&self, buf: &mut BytesMut);
     fn to_json_string(&self) -> String;
 }
 
@@ -602,7 +449,7 @@ pub trait IActorLocationResponse: IActorResponse {
 
 #[async_trait]
 pub trait IMActorHandler : Send + Sync {
-    async fn handle_message(&self, message: Arc<Box<dyn IMessage>>, client_id: usize, sender: std::option::Option<&mpsc::Sender<NetworkMessage>>);
+    async fn handle_message(&self, message: Arc<Box<dyn IMessage>>, client_id: usize, sender: std::option::Option<mpsc::Sender<NetworkMessage>>);
 }
 
 //带应答的ActorLocationRpc消息
@@ -638,8 +485,8 @@ struct KeyedHandler {
 inventory::collect!(KeyedHandler);
 
 lazy_static::lazy_static! {
-    static ref HANDLER_MAP: HashMap<&'static str, &'static Box<dyn IMActorHandler>> = {
-        let mut m = HashMap::new();
+    static ref HANDLER_MAP: DashMap<&'static str, &'static Box<dyn IMActorHandler>> = {
+        let m = DashMap::new();
         for handler in inventory::iter::<KeyedHandler> {
             m.insert(handler.key, &**handler.handler);
         }
@@ -655,8 +502,8 @@ struct MessageParaser {
 inventory::collect!(MessageParaser);
 
 lazy_static::lazy_static! {
-    static ref MESSAGE_PARASER: HashMap<&'static str, &'static Box<dyn IMessage>> = {
-        let mut m = HashMap::new();
+    static ref MESSAGE_PARASER: DashMap<&'static str, &'static Box<dyn IMessage>> = {
+        let m = DashMap::new();
         for handler in inventory::iter::<MessageParaser> {
             m.insert(handler.key, &**handler.paraser);
         }
@@ -740,7 +587,7 @@ impl C2M_PingHandler  {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 pub async fn  process_message_msgpack(data: Arc<Box<dyn IMessage>>, 
     client_id: usize, 
-    sender: std::option::Option<&mpsc::Sender<NetworkMessage>>){
+    sender: std::option::Option<mpsc::Sender<NetworkMessage>>){
     let type_name = data.get_type_name();
         if let Some(handler) = get_handler(type_name) {
         handler.handle_message(data, client_id, sender).await;
@@ -909,7 +756,7 @@ mod tests {
                 write_stream.read(&mut buffer).await.unwrap();
                 
                 let mut ping_msg = Vec::new();
-                crate::C2M_PingRequest{rpc_id:1, _t: "C2M_PingRequest".to_string()}
+                crate::C2M_PingRequest::default()
                     .serialize(&mut rmp_serde::Serializer::new(&mut ping_msg).with_struct_map()).unwrap();
 
                 let mut buf = BytesMut::with_capacity(2 + ping_msg.len());

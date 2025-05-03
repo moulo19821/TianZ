@@ -15,7 +15,7 @@ const CONCURRENT_REQUESTS: usize = 1;
 const TOTAL_REQUESTS: usize = 10;
 
 #[cfg(not(debug_assertions))]
-const CONCURRENT_REQUESTS: usize = 128;
+const CONCURRENT_REQUESTS: usize = 64;
 #[cfg(not(debug_assertions))]
 const TOTAL_REQUESTS: usize = 1280000;
 
@@ -31,10 +31,11 @@ async fn load_test_msgpack() {
             let stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
 
             let mut ping_msg = Vec::new();
-            TiangZ::C2M_PingRequest{rpc_id:1, _t: "C2M_PingRequest".to_string()}
+            TiangZ::C2M_PingRequest::default()
                 .serialize(&mut rmp_serde::Serializer::new(&mut ping_msg).with_struct_map()).unwrap();
 
-            let ping_res_msg = TiangZ::C2M_PingResponse::default().to_bytes();
+            let mut ping_res_msg =  BytesMut::with_capacity(64);
+            TiangZ::C2M_PingResponse::default().to_bytes(&mut ping_res_msg);
 
             let mut buf = BytesMut::with_capacity(2 + ping_msg.len());
             buf.put_u16(ping_msg.len() as u16);
@@ -49,7 +50,7 @@ async fn load_test_msgpack() {
             let reader1 = reader.clone();
 
             let handle = tokio::spawn(async move {
-                let mut response = Vec::with_capacity((ping_res_msg.len()+2) * TOTAL_REQUESTS/CONCURRENT_REQUESTS);
+                let mut response = Vec::with_capacity((ping_res_msg.len()) * TOTAL_REQUESTS/CONCURRENT_REQUESTS);
                 let _ = reader1.lock().await.read_exact(&mut response).await.unwrap();
             });
             
